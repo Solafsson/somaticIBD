@@ -1,0 +1,671 @@
+---
+title: "burden_analyses_lmm_publication_clean"
+author: "Sigurgeir Olafsson"
+date: "11/3/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Burden of somatic mutation in inflammatory bowel disease
+
+This document describes statistical analyses used to test if inflammatory bowel disease (IBD) affects the somatic mutation burden in the colon. 
+
+```{r cars}
+library(ggplot2)
+library(cowplot)
+library(nlme)
+library(lme4)
+library(reshape2)
+
+
+## Read in some data:
+########################
+crypt_meta <- read.table("/Users/so11/phd/so11_nfs/somatic_ibd_p1/sample_info/crypt_metadata_library_bank.txt", h=T)
+patient_meta <- read.table("/Users/so11/phd/so11_nfs/somatic_ibd_p1/sample_info/patient_metaData.txt", h=T)
+crypt_meta <- subset(crypt_meta, WGS_status=="WGS")
+
+mutCount <- read.table("/Users/so11/phd/so11_lustre/somatic_ibd_p1/phylogenics/MPBoot/snv/adj_mutCounts/combined_truncBinom_adjusted.txt", h=T)
+colnames(mutCount) <- c("crypt_ID", "adj_snv")
+
+mutCount_unadj <- read.table("/Users/so11/phd/so11_lustre/somatic_ibd_p1/qc/binomial_filters/combined_Unadj_MutCount.txt", h=T)
+mutCount_unadj$crypt_ID <- gsub("_VAF", "", mutCount_unadj$crypt_ID)
+
+## We can now merge all the datasets:
+crypt_meta <- merge(crypt_meta, mutCount, by="crypt_ID")
+crypt_meta <- merge(crypt_meta, mutCount_unadj, by="crypt_ID")
+crypt_meta <- merge(crypt_meta, patient_meta, by="patient_ID")
+
+## Remove patient from control cohort that was massive outlier - high mutation burden due to chemotherapy
+crypt_meta <- subset(crypt_meta, patient_ID!="O337")
+
+## Need to clean up the crypt_metadata a bit 
+test_cohort <- crypt_meta
+test_cohort <- subset(test_cohort, location!="Ileum" & location!="Terminal_ileum")
+
+## Set disease duration for never inflamed regions as 0
+test_cohort$DiseaseDuration <- as.numeric(as.character(test_cohort$DiseaseDuration))
+test_cohort$DiseaseDuration[is.na(test_cohort$DiseaseDuration)] <- 0
+test_cohort$DiseaseDuration[test_cohort$type=="Never_Inflamed"] <- 0
+
+## Add 0.5 years to disease duration to avoid 0 in this category for newly diagnosed patients. 
+## This is reasonable as IBD symptoms often start months before diagnosis. 
+test_cohort$DiseaseDuration[test_cohort$type!="Never_Inflamed"] <- test_cohort$DiseaseDuration[test_cohort$type!="Never_Inflamed"] +0.5
+
+## The IBD dataset has higher spatial resolution than the control dataset. Set the locations as Left, Right and Transverse
+test_cohort$location[test_cohort$location %in% c("Ascending", "Cecum", "ICV")] <- "Right"
+test_cohort$location[test_cohort$location %in% c("Descending", "Rectum", "Sigmoid")] <- "Left"
+test_cohort$location[test_cohort$location %in% c("Hepatic", "Splenic_flexure")] <- "Transverse"
+
+test_cohort$colour <- "#A72608"
+test_cohort$colour[test_cohort$cohort=="control_data"] <- "#BFD7EA"
+test_cohort$colour[test_cohort$cohort=="ibd_cohort" & test_cohort$type=="Never_Inflamed"] <- "#FCA311"
+
+
+head(subset(test_cohort, cohort=="ibd_cohort"))
+head(subset(test_cohort, cohort=="control_data"))
+dim(subset(test_cohort, cohort=="ibd_cohort"))
+dim(subset(test_cohort, cohort=="control_data"))
+
+length(unique(subset(test_cohort, cohort=="ibd_cohort")$patient_ID))
+length(unique(subset(test_cohort, cohort=="ibd_cohort" & Disease=="CD")$patient_ID))
+length(unique(subset(test_cohort, cohort=="ibd_cohort" & Disease=="UC")$patient_ID))
+length(unique(subset(test_cohort, cohort=="control_data")$patient_ID))
+```
+
+## Linear mixed effects model for substitution counts
+
+I will use the lme() function of the nlme package to fit a linear mixed effects model to the data. This will account for non-independence of the observations - as crypts are grouped by biopsies, and biopsies are nested within patients. 
+
+The components of the model are:
+1. Age and location in the bowel are fixed effects of interest, known from Lee-Six et al. (2019) to affect the somatic mutation burden. 
+
+2. Sequencing coverage and median variant allele fraction are also potentially important contributors but as I carried out an adjustment for these the effect should be modest. 
+
+3. I will allow the slope to vary between biopsy and patient, with biopsy nested within patients. 
+
+4. While the model will allow for random slopes, I fix the intercept at 0. The biological interpretation of this is that there are not somatic mutations at birth (as our filtering strategy will remove most embryonic mutations and these are not of much interest in our study anyway). 
+
+5. I will allow both the within-patient variance and between-variance to vary depending on disease status and formally test if they do so. 
+
+
+### The null model 
+
+I want to confirm that there is indeed no effect of coverage or vaf and then decide if there should be an interaction effect for Age and location. 
+
+```{r}
+# LME model that allows for different variances for each patient and for each corhot (IBD vs controls)
+
+model_null.lme <- lme(fixed = adj_snv ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_null.lme)
+```
+
+
+### Effect of coverage
+
+Despite us having adjusted the branch lengths of the phylogenic trees by coverege and vaf, some effect remains
+
+
+```{r}
+
+model_cov <- lme(fixed = adj_snv ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+## Next test to see if Coverage and/or VAF are significant
+anova(model_null.lme,model_cov, test=T)$"p-value"[2]
+summary(model_cov)
+
+```
+
+We note that the median median VAF is the same in both cohorts while the median coverage of the IBD cohort is slightly higher. 
+
+```{r}
+## Compare the VAF distributions and the coverage between the two different cohorts. 
+ggplot(test_cohort, aes(x=snvMedianVAF)) + geom_histogram() + facet_grid(cohort~.) 
+ggplot(test_cohort, aes(x=Coverage)) + geom_histogram() + facet_grid(cohort~.)
+
+tapply(test_cohort$snvMedianVAF, test_cohort$cohort, median)
+tapply(test_cohort$Coverage, test_cohort$cohort, median)
+```
+
+
+### Confirm that the model residuals are normally distributed
+
+That the standardized residuals are normally distributed is an assumption of the model. 
+
+```{r}
+summary(model_null.lme)
+intervals(model_null.lme, which = "fixed")
+
+plot(model_null.lme, resid(., type="p") ~ Age, abline = 0, col=test_cohort$colour, pch=20 )
+
+```
+
+## Including disease duration improves the fit of the linear mixed effects model
+
+I will fit the same model as model_null.lme except I add a fixed effect for Disease Duration, that is time since diagnosis plus 6 months. Never inflamed regions from IBD patients have Disease duration set to 0. 
+
+```{r}
+
+model_dur.lme <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur.lme)
+intervals(model_dur.lme, which = "fixed")
+anova(model_null.lme,model_dur.lme, test=T)$"p-value"[2]
+
+```
+
+
+The above model does not include Coverage. We can try adding it in and we see that it makes very little difference to the analysis as the effect is very small compared with the effect of age and disease duration. 
+
+```{r}
+
+model_dur_cov.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_cov.lme)
+intervals(model_dur_cov.lme, which = "fixed")
+anova(model_cov,model_dur_cov.lme, test=T)$"p-value"[2]
+
+```
+
+## Plot the model: 
+```{r}
+
+lme.ints <- intervals(model_dur.lme, which="fixed")$fixed
+par(mar=c(5.1,6.1,4.1,2.1))
+ plot(NULL, xlim=c(0, (max(test_cohort$Age)+2)), ylim=c(0, (max(test_cohort$adj_snv)+1000)), 
+     xlab="Age [Years]", ylab="Substitutions / crypt", yaxs="i", xaxs="i",cex.lab=1, cex.axis=1)
+
+
+polygon(x = c(0, max(test_cohort$Age), max(test_cohort$Age), 0),
+        y = c(lme.ints["(Intercept)", "lower"], 
+              lme.ints["(Intercept)", "lower"] + max(test_cohort$Age) * lme.ints["Age", "lower"],
+              lme.ints["(Intercept)", "upper"] + max(test_cohort$Age) * lme.ints["Age", "upper"],
+              lme.ints["(Intercept)", "upper"]),
+        col="#BFD7EA", border=NA)
+lines(x = c(0, max(test_cohort$Age)), 
+      y = c(lme.ints["(Intercept)", "est."], 
+            lme.ints["(Intercept)", "est."] + max(test_cohort$Age) * lme.ints["Age", "est."]),
+      lwd=2)
+
+points(x = test_cohort$Age, y = test_cohort$adj_snv, bg=alpha(test_cohort$colour, 0.65), pch=21, cex=1)
+
+legend(x = 5, y = 11700, col = "black", pch=21 ,pt.bg=unique(test_cohort$colour), bty="n", pt.cex = 1,cex=1,
+       legend = c("Controls", "IBD - Never inflamed","IBD-with inflammation \n history"))
+
+```
+
+
+
+
+## Restricted analyses
+
+I want to see how this looks like when I only look at specific restricted sub-types of data. 
+
+We do observe that never-inflamed regions from IBD patients have a higher mutation burden than controls. This may reflect that there is some uncertainty in the annotation of the biopsies. It might also mean that the effect of inflammation extends beyond the immediately inflamed sites or it might be batch effect.
+
+We also observe that there is an effect of disease duration within the IBD cohort.
+
+```{r}
+never_infl_only <- subset(test_cohort, type=="Never_Inflamed")
+
+model_ibd_never_infl1 <- lme(fixed = adj_snv ~ Age + location + cohort, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = never_infl_only, method="ML")
+
+model_ibd_never_infl2 <- lme(fixed = adj_snv ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = never_infl_only, method="ML")
+
+anova(model_ibd_never_infl1,model_ibd_never_infl2, test=T)$"p-value"[2]
+summary(model_ibd_never_infl1)
+
+
+## Just in the diseased samples, is there an effect of disease duration?
+ibd_only <- subset(test_cohort, cohort=="ibd_cohort")
+model_ibd_only.lme <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_only, method="ML")
+
+summary(model_ibd_only.lme)
+
+
+```
+
+
+## IBD affects the between-patient variance in mutation burden
+
+Next we want to see if the between-patient variance is greater in IBD patients than in the controls. This might be expected as disease severity varies between the patients and patients vary in their response to treatment.  
+
+From the analysis below, we conclude that there is significant difference in the between-patient variance but not in the within-patient variance. 
+
+```{r, eval=F, echo=T}
+
+
+model_dur.btwbio.het <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~cohort-  1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur.btwpt.het <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort- 1), biopsy_ID = pdSymm(form = ~ 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_dur.btwpt.het, model_dur.lme, test=TRUE)$"p-value"[2]
+anova(model_dur.btwbio.het, model_dur.lme, test=TRUE)$"p-value"[2]
+
+
+```
+
+
+
+## Repeat the above analyses for indels
+
+```{r}
+
+indel_counts <- read.table("/Users/so11/phd/so11_lustre/somatic_ibd_p1/phylogenics/MPBoot/indel/adj_mutCounts/combined_truncBinom_adjusted.txt", h=T)
+colnames(indel_counts) <- c("crypt_ID", "adj_indel")
+
+test_cohort <- merge(test_cohort, indel_counts, by="crypt_ID", all.x=T)
+
+## There is an as-yet unidentified problem with patient40. Will sort that out before re-submission...
+test_cohort_indel <- subset(test_cohort, !is.na(test_cohort$adj_indel))
+
+model_null.indel <- lme(fixed = adj_indel  ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_indel, method="ML")
+
+
+summary(model_null.indel)
+intervals(model_null.indel, which = "fixed")
+
+colour.palette.2 <- c("#BFD7EA","#A72608")
+names(colour.palette.2) <- c("control_data", "ibd_cohort")
+plot(model_null.indel, resid(., type="p") ~ Age, abline = 0, col=colour.palette.2[test_cohort_indel$cohort], pch=20 )
+
+
+model_dur.indel <- lme(fixed = adj_indel ~ Age + location  + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_indel, method="ML")
+
+summary(model_dur.indel)
+intervals(model_dur.indel, which = "fixed")
+anova(model_null.indel,model_dur.indel, test=T)$"p-value"[2]
+
+
+
+## Plot the model
+#######################
+
+lme.ints <- intervals(model_dur.indel, which="fixed")$fixed
+plot(NULL, xlim=c(0, (max(test_cohort_indel$Age)+2)), ylim=c(0, (max(test_cohort_indel$adj_indel)+100)), 
+     xlab="Age [Years]", ylab="InDels / crypt", yaxs="i", xaxs="i")
+
+
+polygon(x = c(0, max(test_cohort_indel$Age), max(test_cohort_indel$Age), 0),
+        y = c(lme.ints["(Intercept)", "lower"], 
+              lme.ints["(Intercept)", "lower"] + max(test_cohort_indel$Age) * lme.ints["Age", "lower"],
+              lme.ints["(Intercept)", "upper"] + max(test_cohort_indel$Age) * lme.ints["Age", "upper"],
+              lme.ints["(Intercept)", "upper"]),
+        col="#BFD7EA", border=NA)
+lines(x = c(0, max(test_cohort_indel$Age)), 
+      y = c(lme.ints["(Intercept)", "est."], 
+            lme.ints["(Intercept)", "est."] + max(test_cohort_indel$Age) * lme.ints["Age", "est."]),
+      lwd=2)
+
+points(x = test_cohort$Age, y = test_cohort$adj_indel, bg=alpha(test_cohort$colour, 0.65), pch=21, cex=1.5)
+
+legend(x = 0.2, y = 900, col = "black", pch=21 ,pt.bg=unique(test_cohort$colour), bty="n", pt.cex = 1.5,
+       legend = c("Controls", "IBD - Never inflamed","IBD-with inflammation \n history"))
+
+```
+
+## Burden of structural variants
+
+```{r}
+cnvs <- read.table("/Users/so11/phd/so11_nfs/somatic_ibd_p1/structural_variation/manual_review/Supplementary_Table4_SV_del_and_dup.txt", h=T)
+
+counts <- data.frame(table(cnvs$crypt_ID))
+colnames(counts) <- c("crypt_ID", "SV_count")
+test_cohort <- merge(test_cohort, counts, by="crypt_ID", all.x=T)
+
+## If the crypt has no calls in the cnvs file then it should have the count of 0
+test_cohort$SV_count[is.na(test_cohort$SV_count)] <- 0
+
+sv_model.null <- glmer(SV_count ~ Age + location + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+sv_model.dur <- glmer(SV_count ~ Age + location + DiseaseDuration + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+anova(sv_model.null,sv_model.dur, test=T)$"Pr(>Chisq)"[2]
+
+summary(sv_model.dur)$coefficients
+
+## Get the 95% confidence intervals for the effect estimate. 
+summary(sv_model.dur)$coefficients[5,1] - 1.96*summary(sv_model.dur)$coefficients[5,2]
+summary(sv_model.dur)$coefficients[5,1] + 1.96*summary(sv_model.dur)$coefficients[5,2]
+
+
+
+x <- test_cohort
+frac_sv_ibd <- c(nrow(x[x$cohort=="ibd_cohort" & x$SV_count==0 & x$type %in% c("Inflamed", "Prev_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Inflamed", "Prev_Inflamed"),]),
+                 nrow(x[x$cohort=="ibd_cohort" & x$SV_count==1 & x$type %in% c("Inflamed", "Prev_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Inflamed", "Prev_Inflamed"),]),
+                 nrow(x[x$cohort=="ibd_cohort" & x$SV_count==2 & x$type %in% c("Inflamed", "Prev_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Inflamed", "Prev_Inflamed"),]),
+                 nrow(x[x$cohort=="ibd_cohort" & x$SV_count>2 & x$type %in% c("Inflamed", "Prev_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Inflamed", "Prev_Inflamed"),]))
+
+frac_sv_nevI <- c(nrow(x[x$cohort=="ibd_cohort" & x$SV_count==0 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="ibd_cohort" & x$SV_count==1 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="ibd_cohort" & x$SV_count==2 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="ibd_cohort" & x$SV_count>2 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="ibd_cohort"& x$type %in% c("Never_Inflamed"),]))
+
+frac_sv_ctrl <- c(nrow(x[x$cohort=="control_data" & x$SV_count==0 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="control_data"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="control_data" & x$SV_count==1 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="control_data"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="control_data" & x$SV_count==2 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="control_data"& x$type %in% c("Never_Inflamed"),]),
+                  nrow(x[x$cohort=="control_data" & x$SV_count>2 & x$type %in% c("Never_Inflamed"),])/nrow(x[x$cohort=="control_data"& x$type %in% c("Never_Inflamed"),]))
+
+
+sv_plot_data <- data.frame(SV_count=c("0", "1", "2", ">2"), frac_sv_ctrl,frac_sv_nevI, frac_sv_ibd)
+colnames(sv_plot_data) <- c("SV_count", "Controls", "IBD never inflamed", "IBD with inflammation\n history")
+sv_plot_data_m <- melt(sv_plot_data)
+sv_plot_data_m$SV_count <- factor(sv_plot_data_m$SV_count, levels=c("0", "1", "2", ">2"))
+
+ggplot(sv_plot_data_m, aes(x=SV_count, y=value, fill=variable)) + geom_bar(position = "dodge", stat="identity") + 
+  labs(y="Percentage of crypts", x="Number of SVs") + theme_bw() + theme(legend.title = element_blank()) + 
+  theme(panel.grid = element_blank()) + theme(legend.position = c(0.75,0.75)) + 
+  theme(legend.text = element_text(size=18), axis.text = element_text(size=16), axis.title = element_text(size=18)) +
+  scale_y_continuous(expand = c(0,0), limits=c(0,1)) + scale_fill_manual(values = c("#BFD7EA","#FCA311", "#A72608"))
+
+
+```
+
+
+
+
+
+## LMM for signature exposure
+
+```{r}
+SignatureExposure <- read.table("/Users/so11/phd/so11_lustre/somatic_ibd_p1/signature_extraction/hdp/snvs/crypt_exposure_mutCounts_post_EM.txt", h=T)
+
+test_cohort <- merge(test_cohort, SignatureExposure, all.x=T)
+
+Suppl_table_2 <- test_cohort[, c("crypt_ID", "patient_ID","Sex","Age","cohort", "Disease", "DiseaseDuration", 
+                                 "Purine_years","biopsy_ID","location", "type","Coverage",
+                                 "snvMedianVAF", "indelMedianVAF","adj_snv", "adj_indel","SV_count",
+                                 "Unassigned", "SBS1", "SBS5", "SBSA", "SBS18", "SBS32",
+                                 "SBSB", "SBS17b", "SBS35", "SBS13", "SBS2", "SBS17a")]
+
+write.table(Suppl_table_2, "/Users/so11/phd/somatic_ibd_p1/manuscript/Supplementary_material/Supplementary_Table2_crypt_metaData.txt", row.names=F, quote=F)
+
+### Signature 1
+##################
+
+model_null.sbs1 <- lme(fixed = SBS1 ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS1)), method="ML")
+
+summary(model_null.sbs1)
+
+
+model_dur.sbs1 <- lme(fixed = SBS1 ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS1)), method="ML")
+
+summary(model_dur.sbs1)
+intervals(model_dur.sbs1, which = "fixed")
+anova(model_null.sbs1,model_dur.sbs1, test=T)$"p-value"[2]
+
+
+
+### Signature 5
+##################
+model_null.sbs5 <- lme(fixed = SBS5 ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS5)), method="ML")
+
+summary(model_null.sbs5)
+
+
+model_dur.sbs5 <- lme(fixed = SBS5 ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS5)), method="ML")
+
+summary(model_dur.sbs5)
+intervals(model_dur.sbs5, which = "fixed")
+anova(model_null.sbs5,model_dur.sbs5, test=T)$"p-value"[2]
+
+
+### Signature 18
+####################
+model_null.sbs18 <- lme(fixed = SBS18 ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS18)), method="ML")
+
+summary(model_null.sbs18)
+
+
+model_dur.sbs18 <- lme(fixed = SBS18 ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS18)), method="ML")
+
+summary(model_dur.sbs18)
+intervals(model_dur.sbs18, which = "fixed")
+anova(model_null.sbs18,model_dur.sbs18, test=T)$"p-value"[2]
+
+
+
+### Plot these models
+
+sig_colours <- c("#F5BB00","#53ADFC","#FCECC9","#067C06", "#DD3B46","#C46BAE", "#0566C6","#B5ABAB", 
+                 "#F17300", "#A7CECB", "#2D2A32",
+                 "#247BA0")
+
+colour.palette.2 <- c("#91B6BF","#A72608")
+names(colour.palette.2) <- c("control_data", "ibd_cohort")
+lme.ints <- intervals(model_dur.sbs1, which="fixed")$fixed
+par(mar=c(5.1,5.1,4.1,2.1))
+ plot(NULL, xlim=c(0, (max(test_cohort$Age)+2)), ylim=c(0, (max(test_cohort$SBS1, na.rm=T)+200)), 
+     xlab="Age [Years]", ylab="SBS1 / crypt", yaxs="i", xaxs="i",cex.lab=2, cex.axis=2)
+
+
+polygon(x = c(0, max(test_cohort$Age), max(test_cohort$Age), 0),
+        y = c(lme.ints["(Intercept)", "lower"], 
+              lme.ints["(Intercept)", "lower"] + max(test_cohort$Age) * lme.ints["Age", "lower"],
+              lme.ints["(Intercept)", "upper"] + max(test_cohort$Age) * lme.ints["Age", "upper"],
+              lme.ints["(Intercept)", "upper"]),
+        col=sig_colours[2], border=NA)
+lines(x = c(0, max(test_cohort$Age)), 
+      y = c(0, 
+            lme.ints["(Intercept)", "est."] + max(test_cohort$Age) * lme.ints["Age", "est."]),
+      lwd=2)
+
+points(x = test_cohort$Age, y = test_cohort$SBS1, bg=alpha(test_cohort$colour, 0.65), pch=21, cex=1.5)
+
+legend(x = 5, y = 3000, col = "black", pch=21 ,pt.bg=unique(test_cohort$colour), bty="n", pt.cex = 2,cex=1.8,
+       legend = c("Controls", "IBD - Never inflamed","IBD-with inflammation \n history"))
+
+
+
+colour.palette.2 <- c("#91B6BF","#A72608")
+names(colour.palette.2) <- c("control_data", "ibd_cohort")
+lme.ints <- intervals(model_dur.sbs5, which="fixed")$fixed
+par(mar=c(5.1,5.1,4.1,2.1))
+ plot(NULL, xlim=c(0, (max(test_cohort$Age)+2)), ylim=c(0, (max(test_cohort$SBS5, na.rm=T)+200)), 
+     xlab="Age [Years]", ylab="SBS5 / crypt", yaxs="i", xaxs="i",cex.lab=2, cex.axis=2)
+
+
+polygon(x = c(0, max(test_cohort$Age), max(test_cohort$Age), 0),
+        y = c(lme.ints["(Intercept)", "lower"], 
+              lme.ints["(Intercept)", "lower"] + max(test_cohort$Age) * lme.ints["Age", "lower"],
+              lme.ints["(Intercept)", "upper"] + max(test_cohort$Age) * lme.ints["Age", "upper"],
+              lme.ints["(Intercept)", "upper"]),
+        col=sig_colours[3], border=NA)
+lines(x = c(0, max(test_cohort$Age)), 
+      y = c(0, 
+            lme.ints["(Intercept)", "est."] + max(test_cohort$Age) * lme.ints["Age", "est."]),
+      lwd=2)
+
+points(x = test_cohort$Age, y = test_cohort$SBS5, bg=alpha(test_cohort$colour, 0.65), pch=21, cex=1.5)
+
+#legend(x = 5, y = 3000, col = "black", pch=21 ,pt.bg=unique(test_cohort$colour), bty="n", pt.cex = 2,cex=1.8,
+#       legend = c("Controls", "IBD - Never inflamed","IBD-with inflammation \n history"))
+
+
+
+
+### SBS18
+###########
+
+colour.palette.2 <- c("#91B6BF","#A72608")
+names(colour.palette.2) <- c("control_data", "ibd_cohort")
+lme.ints <- intervals(model_dur.sbs18, which="fixed")$fixed
+par(mar=c(5.1,5.1,4.1,2.1))
+ plot(NULL, xlim=c(0, (max(test_cohort$Age)+2)), ylim=c(0, (max(test_cohort$SBS18, na.rm=T)+200)), 
+     xlab="Age [Years]", ylab="SBS18 / crypt", yaxs="i", xaxs="i",cex.lab=2, cex.axis=2)
+
+
+polygon(x = c(0, max(test_cohort$Age), max(test_cohort$Age), 0),
+        y = c(lme.ints["(Intercept)", "lower"], 
+              lme.ints["(Intercept)", "lower"] + max(test_cohort$Age) * lme.ints["Age", "lower"],
+              lme.ints["(Intercept)", "upper"] + max(test_cohort$Age) * lme.ints["Age", "upper"],
+              lme.ints["(Intercept)", "upper"]),
+        col=sig_colours[5], border=NA)
+lines(x = c(0, max(test_cohort$Age)), 
+      y = c(0, 
+            lme.ints["(Intercept)", "est."] + max(test_cohort$Age) * lme.ints["Age", "est."]),
+      lwd=2)
+
+points(x = test_cohort$Age, y = test_cohort$SBS18, bg=alpha(test_cohort$colour, 0.65), pch=21, cex=1.5)
+
+
+```
+
+
+
+### Differences between CD and UC
+
+I want to find out if there are differences between CD and UC in terms of the mutation burden or eposure to any particular signatures. 
+
+```{r}
+
+ibd_data <- subset(test_cohort, cohort=="ibd_cohort")
+
+
+## First look into the mutation burden. Add a fixed effect for Disease. 
+## Allow variance to vary between the two diseases. 
+model_null.ibd <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = ibd_data, method="ML")
+
+model_dur.ibd <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = ibd_data, method="ML")
+
+summary(model_dur.ibd)
+intervals(model_dur.ibd, which = "fixed")
+anova(model_null.ibd,model_dur.ibd, test=T)$"p-value"[2]
+
+
+model_null.ibd.indel <- lme(fixed = adj_indel ~ Age + location + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$adj_indel)), method="ML")
+
+model_dur.ibd.indel <- lme(fixed = adj_indel ~ Age + location + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$adj_indel)), method="ML")
+
+summary(model_dur.ibd.indel)
+intervals(model_dur.ibd.indel, which = "fixed")
+anova(model_null.ibd.indel,model_dur.ibd.indel, test=T)$"p-value"[2]
+
+
+## SVs
+sv_model_ibd.null <- glmer(SV_count ~ Age +  DiseaseDuration + (Age - 1|patient_ID/biopsy_ID), data=ibd_data, family="poisson")
+sv_model_ibd.dis <- glmer(SV_count ~ Age + DiseaseDuration + Disease + (Age - 1|patient_ID/biopsy_ID), data=ibd_data, family="poisson")
+
+anova(sv_model_ibd.null,sv_model_ibd.dis, test=T)$"Pr(>Chisq)"[2]
+
+## Next look into the burden of specific signatures
+
+```
+
+So there is no significant difference between CD and UC in terms of the total mutation burden. 
+
+I next want to test for a difference in specific signature exposure. 
+
+```{r}
+
+model_null.ibd.sbs1 <- lme(fixed = SBS1 ~ Age + location + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS1)), method="ML")
+
+model_dur.ibd.sbs1 <- lme(fixed = SBS1 ~ Age + location + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS1)), method="ML")
+
+summary(model_dur.ibd.sbs1)
+intervals(model_dur.ibd.sbs1, which = "fixed")
+anova(model_null.ibd.sbs1,model_dur.ibd.sbs1, test=T)$"p-value"[2]
+
+
+
+model_null.ibd.sbs5 <- lme(fixed = SBS5 ~ Age + location + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS5)), method="ML")
+
+model_dur.ibd.sbs5 <- lme(fixed = SBS5 ~ Age + location + DiseaseDuration*Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS5)), method="ML")
+
+summary(model_dur.ibd.sbs5)
+intervals(model_dur.ibd.sbs5, which = "fixed")
+anova(model_null.ibd.sbs5,model_dur.ibd.sbs5, test=T)$"p-value"[2]
+
+
+
+model_null.ibd.sbs18 <- lme(fixed = SBS18 ~ Age + location + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS18)), method="ML")
+
+model_dur.ibd.sbs18 <- lme(fixed = SBS18 ~ Age + location + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$SBS18)), method="ML")
+
+summary(model_dur.ibd.sbs18)
+intervals(model_dur.ibd.sbs18, which = "fixed")
+anova(model_null.ibd.sbs18,model_dur.ibd.sbs18, test=T)$"p-value"[2]
+
+```

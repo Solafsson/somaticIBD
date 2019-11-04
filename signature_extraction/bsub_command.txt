@@ -1,0 +1,9 @@
+
+# bigger run, with longer burnin and more chains.
+
+output_dir=/lustre/scratch114/projects/crohns/somatic_ibd_p1/signature_extraction/hdp/snvs/
+log_dir=/lustre/scratch114/projects/crohns/somatic_ibd_p1/signature_extraction/hdp/snvs/logs/
+command_list=/lustre/scratch114/projects/crohns/somatic_ibd_p1/signature_extraction/hdp/snvs/commands.lst
+
+bsub -n4 -R 'span[hosts=1]' -J 'hdp_no_prior[1-20]' -o ${log_dir}output_w_prior.%J.%I -e ${log_dir}error_w_prior.%J.%I -R 'select[mem>=3000] rusage[mem=3000]' -M3000 \
+-q basement '/nfs/users/nfs_k/kr2/GitHub/cgpAnalyseHub/bin/farm_idx_exec.pl ${command_list} $LSB_JOBINDEX'
