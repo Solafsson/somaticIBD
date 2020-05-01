@@ -1,0 +1,969 @@
+---
+title: "Mutation_Rates_lmm"
+author: "Sigurgeir Olafsson"
+date: "11/3/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Burden of somatic mutation in inflammatory bowel disease
+
+This document describes statistical analyses used to test if inflammatory bowel disease (IBD) affects the somatic mutation burden in the colon. 
+
+Any questions or comments on the contents of this file should be directed to Sigurgeir Olafsson, so11'@'sanger.ac.uk
+
+Load the following packages and read in the data from Supplementary Table 2. 
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(cowplot)
+library(nlme)
+library(lme4)
+library(reshape2)
+
+
+## Read the data:
+########################
+test_cohort <- read.table("/Users/so11/phd/somatic_ibd_p1/manuscript/Cell_submission/Re_submission/Supplementary_material/Supplementary_Table2_crypt_metaData.txt", h=T)
+
+test_cohort$colour <- "#A72608"
+test_cohort$colour[test_cohort$cohort=="control_data"] <- "#BFD7EA"
+test_cohort$colour[test_cohort$cohort=="ibd_cohort" & test_cohort$type=="Never_Inflamed"] <- "#FCA311"
+
+
+head(subset(test_cohort, cohort=="ibd_cohort"))
+head(subset(test_cohort, cohort=="control_data"))
+dim(subset(test_cohort, cohort=="ibd_cohort"))
+dim(subset(test_cohort, cohort=="control_data"))
+
+length(unique(subset(test_cohort, cohort=="ibd_cohort")$patient_ID))
+length(unique(subset(test_cohort, cohort=="ibd_cohort" & Disease=="CD")$patient_ID))
+length(unique(subset(test_cohort, cohort=="ibd_cohort" & Disease=="UC")$patient_ID))
+length(unique(subset(test_cohort, cohort=="control_data")$patient_ID))
+```
+
+## Linear mixed effects model for substitution counts
+
+I will use the lme() function of the nlme package to fit a linear mixed effects model to the data. This will account for non-independence of the observations - as crypts are grouped by biopsies, and biopsies are nested within patients. 
+
+The components of the model are:
+
+1. Age of the patient and the location in the bowel the biopsy comes from are fixed effects of interest, known from Lee-Six et al. (2019) to affect the somatic mutation burden. 
+
+2. Sequencing coverage and median variant allele fraction are also potentially important contributors but as I carried out an adjustment for these the effect should be modest. 
+
+3. I will allow the slope to vary between biopsy and patient, with biopsy nested within patients. 
+
+4. While the model will allow for random slopes, I fix the intercept at 0. The biological interpretation of this is that there are not somatic mutations at birth (as our filtering strategy will remove most embryonic mutations and these are not of much interest in our study anyway since they are not related to IBD). 
+
+5. I will allow both the within-patient variance and between-variance to vary depending on disease status and formally test if they do so. 
+
+
+### Effect of coverage and VAF
+
+As described in the methods section, I corrected the branch lengths of the phylogenetic trees for Coverage and VAF. The code for doing this is available in https://github.com/Solafsson/somaticIBD/tree/master/phylogenics/treemut.R
+
+I want to test if there is some remaining effect of Coverage and VAF.
+
+```{r}
+model_null.lme <- lme(fixed = adj_snv ~ Age + location, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_cov <- lme(fixed = adj_snv ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_vaf <- lme(fixed = adj_snv ~ Age + location + snvMedianVAF, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+## Next test to see if Coverage and VAF are significant
+anova(model_null.lme,model_cov, test=T)$"p-value"[2]
+anova(model_null.lme,model_vaf, test=T)$"p-value"[2]
+
+```
+
+We conclude that despite the correction during the building of the phylogenetic trees, some effect of coverage remains, but there is no effect of VAF. model_cov will be the null model moving forward. 
+
+As shown in Figure S1A and B, the median-median VAF is identical between the two cohorts. The Coverage of the IBD cohort is higher than that of the control cohort. The effect of coverage in the model is quite small though and it makes very little difference if it is included or not. 
+
+
+```{r}
+tapply(test_cohort$snvMedianVAF, test_cohort$cohort, median)
+tapply(test_cohort$Coverage, test_cohort$cohort, median)
+
+summary(model_cov)
+```
+
+
+### Confirm that the model residuals are normally distributed
+
+That the standardized residuals are normally distributed is an assumption of the model. The residuals of the pediatric control subjects are quite small but I think it is safe to move forward regardless since the residuals don't look like they are correlated with age. 
+
+```{r}
+intervals(model_cov, which = "fixed")
+plot(model_cov, resid(., type="p") ~ Age, abline = 0, col=test_cohort$colour, pch=20 )
+```
+
+## Including disease duration improves the fit of the linear mixed effects model
+
+Ideally, I would include in the model some measure of inflammation exposure. This could be a function of the disease severity over time. Unfortunately, this data is not available. Some of the patients have decades of IBD history and have in some cases been managed at different hospitals for the duration of their disease. Instead, I will use the time since IBD diagnosis as a proxy for inflammation exposure.
+
+I will fit the same model as model_cov except I add a fixed effect for Disease Duration, that is time since diagnosis plus 6 months. I have added six months to the disease duration since many patients start experiencing symptoms several months before diagnosis, and do avoid assigning a disease duration of 0 to patients that donated biopsies at the time of diagnosis. However, never inflamed regions from IBD patients have Disease duration set to 0. 
+
+
+```{r}
+model_dur_cov.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+```
+
+This is the model used when reporting on the substitution burden in the main text of the manuscript.
+
+```{r}
+intervals(model_dur_cov.lme, which = "fixed")
+summary(model_dur_cov.lme)
+anova(model_cov,model_dur_cov.lme, test=T)$"p-value"[2]
+```
+
+Repeating the above for indels, we see that it is very important to include coverage in the model and that the effect of IBD on the indel burden is relatively large and highly significant. 
+
+```{r}
+model_null.indel <- lme(fixed = adj_indel  ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_cov.indel <- lme(fixed = adj_indel ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur_cov.indel, which = "fixed")
+anova(model_null.indel,model_dur_cov.indel, test=T)$"p-value"[2]
+summary(model_dur_cov.indel)
+```
+
+
+## Restricted analyses
+
+As a sanity check, I want to see how this looks like when I only look at specific restricted sub-types of data. We do observe that never-inflamed regions from IBD patients do not have a higher mutation burden than controls. We also observe that there is an effect of disease duration within the IBD cohort. 
+
+```{r}
+never_infl_only <- subset(test_cohort, type=="Never_Inflamed")
+
+model_ibd_never_infl1 <- lme(fixed = adj_snv ~ Age + location + cohort + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = never_infl_only, method="ML")
+
+model_ibd_never_infl2 <- lme(fixed = adj_snv ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = never_infl_only, method="ML")
+
+anova(model_ibd_never_infl1,model_ibd_never_infl2, test=T)$"p-value"[2]
+summary(model_ibd_never_infl1)
+
+
+## Just in the diseased samples, is there an effect of disease duration?
+ibd_only <- subset(test_cohort, cohort=="ibd_cohort")
+model_ibd_only.lme <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_only, method="ML")
+
+summary(model_ibd_only.lme)
+
+## And for indels
+model_ibd_only.lme_indel <- lme(fixed = adj_indel ~ Age + location + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_only, method="ML")
+
+summary(model_ibd_only.lme_indel)
+```
+
+In response to a reviewer's comment, I want to show that the IBD effect on mutation burden is not just driven by crypts carrying driver mutations or the few patients that have really high mutation burdens. 
+
+```{r}
+
+test_cohort_no_driver <- subset(test_cohort, cancer_driver==0)
+
+model_cov_no_driver <- lme(fixed = adj_snv ~ Age + location +Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_driver, method="ML")
+
+model_dur_cov.lme_no_driver <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_driver, method="ML")
+
+summary(model_dur_cov.lme_no_driver)
+intervals(model_dur_cov.lme_no_driver, which = "fixed")
+anova(model_cov_no_driver,model_dur_cov.lme_no_driver, test=T)$"p-value"[2]
+
+
+test_cohort_no_outliers <- test_cohort[!(test_cohort$patient_ID %in% c("patient40", "patient35", "patient36", "patient37", "patient50")),]
+
+model_cov_no_outl <- lme(fixed = adj_snv ~ Age + location +Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_outliers, method="ML")
+
+model_dur_cov.lme_no_outl <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_outliers, method="ML")
+
+summary(model_dur_cov.lme_no_outl)
+intervals(model_dur_cov.lme_no_outl, which = "fixed")
+anova(model_cov_no_outl,model_dur_cov.lme_no_outl, test=T)$"p-value"[2]
+
+
+
+## Repeat that for indels
+############################
+
+model_cov_no_driver_id <- lme(fixed = adj_indel ~ Age + location +Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_driver, method="ML")
+
+model_dur_cov.lme_no_driver_id <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_driver, method="ML")
+
+summary(model_dur_cov.lme_no_driver_id)
+intervals(model_dur_cov.lme_no_driver_id, which = "fixed")
+anova(model_cov_no_driver_id,model_dur_cov.lme_no_driver_id, test=T)$"p-value"[2]
+
+
+
+model_cov_no_outl_id <- lme(fixed = adj_indel ~ Age + location +Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_outliers, method="ML")
+
+model_dur_cov.lme_no_outl_id <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort_no_outliers, method="ML")
+
+summary(model_dur_cov.lme_no_outl_id)
+intervals(model_dur_cov.lme_no_outl_id, which = "fixed")
+anova(model_cov_no_outl_id,model_dur_cov.lme_no_outl_id, test=T)$"p-value"[2]
+```
+
+
+
+
+
+Finally, we can assess the effect of smoking in the IBD cohort. Smoking is associated with the risk of colorectal cancer and people have made the rather puzzling observation that smoking increases the risk of CD and is for UC. Unfortunately, smoking status is missing for a few IBD patients and is available for hardly any of the controls. 
+
+Looking only in this restricted dataset where smoking information is available, we see that there is a significant fixed effect of smoking years on both the substitution and indel burden. 
+
+
+```{r}
+ibd_smokers <- subset(ibd_only, !is.na(Smoking_years))
+ibd_smokers$Disease <- as.factor(as.character(ibd_smokers$Disease))
+
+## Look into the effects of smoking on the mutation burden of IBD patients. 
+model_ibd_smoking.lme <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration + Coverage + Smoking_years, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+model_ibd_only.lme <- lme(fixed = adj_snv ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+anova(model_ibd_only.lme,model_ibd_smoking.lme, test=T)$"p-value"[2]
+intervals(model_ibd_smoking.lme, which = "fixed")
+
+model_ibd_smoking.lme_indel <- lme(fixed = adj_indel ~ Age + location + DiseaseDuration + Coverage + Smoking_years, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+model_ibd_only.lme_indel <- lme(fixed = adj_indel ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+
+anova(model_ibd_only.lme_indel,model_ibd_smoking.lme_indel, test=T)$"p-value"[2]
+intervals(model_ibd_smoking.lme_indel, which = "fixed")
+```
+
+### Smoking in CD patients vs UC
+
+To look for a difference between CD and UC patients, I fit a model which 1) includes a fixed effect for Disease sub-type and 2) a model which includes an interaction term between smoking duration and disease. As show below, neither of these effects is significant, suggesting there is no difference between CD and UC. 
+
+```{r}
+model_ibd_smoking.uc_cd <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration + Coverage + Smoking_years + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+anova(model_ibd_smoking.lme,model_ibd_smoking.uc_cd, test=T)$"p-value"[2]
+summary(model_ibd_smoking.uc_cd)
+
+
+model_ibd_smoking.uc_cd_interaction <- lme(fixed = adj_snv ~ Age + location + DiseaseDuration + Coverage + Smoking_years*Disease, 
+                      random = list(patient_ID = pdSymm(form = ~  1), biopsy_ID = pdSymm(form = ~  1)), 
+                      weights = varIdent(form= ~ 1 ),
+                      data = ibd_smokers, method="ML")
+
+anova(model_ibd_smoking.lme,model_ibd_smoking.uc_cd_interaction, test=T)$"p-value"[2]
+summary(model_ibd_smoking.uc_cd_interaction)
+```
+
+
+## IBD affects the between-patient variance in mutation burden
+
+Next I want to see if the between-patient variance is greater in IBD patients than in the controls. This might be expected as disease severity varies between the patients and patients vary in their response to treatment. 
+
+```{r}
+
+model_dur.btwpt.het <- lme(fixed = adj_snv ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort- 1), biopsy_ID = pdSymm(form = ~ 1)),
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_dur.btwpt.het, model_dur_cov.lme, test=TRUE)$"p-value"[2]
+
+
+model_dur.btwpt.het_indel <- lme(fixed = adj_indel ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort- 1), biopsy_ID = pdSymm(form = ~ 1)),
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_dur.btwpt.het_indel, model_dur_cov.indel, test=TRUE)$"p-value"[2]
+```
+
+I also test if there is a difference in the within-patient variance, as might be expected since different regions of the colon may be differentially affected by the disease. This is ie, a test for heteroscedasticity.
+
+```{r}
+model_dur.btwbio.het <- lme(fixed = adj_snv ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~cohort-  1)),
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_dur.btwbio.het, model_dur_cov.lme, test=TRUE)$"p-value"[2]
+
+
+
+model_dur.btwbio.het_indel <- lme(fixed = adj_indel ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~cohort-  1)),
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_dur.btwbio.het_indel, model_dur_cov.indel, test=TRUE)$"p-value"[2]
+```
+
+
+
+## Predict IBD mutation burden
+
+This is what is shown in Figure 1b. 
+
+Both reviewers and co-authors keep insisting that it would be useful to see the 'residual effect' from the age model as a function of the disease duration. This is not straightforward in the above lmm framework where I have nested random effects and allow for different variances between cohorts. I'm going to do this a bit differently instead. 
+
+I want to train a model on the control data and use it to predict mutation burden in the IBD data. 
+We have to abandon the modeling of different variances in the cohort and predictions can only be made at the cohort level (if Coverage isn't included, the numbers for crypts from the same patient are identical). There is no way to estimate random effects so
+
+"The predictions at level i are obtained by adding together the contributions from the estimated fixed effects and the estimated random effects at levels less or equal to i and evaluating the model function at the resulting estimated parameters. If group values not included in the original grouping factors are present in newdata, the corresponding predictions will be set to NA for levels greater or equal to the level at which the unknown groups occur." (From the predict.nlme() documentation)
+
+This obviously means that the model is not exactly the same as the one used to report effects in the main text, but I only use it to graphically convey the message of disease duration being associated with increased mutation burden. 
+
+```{r}
+# https://rdrr.io/cran/nlme/man/predict.nlme.html
+
+ctrl <- subset(test_cohort, cohort=="control_data")
+ibd <-  subset(test_cohort, cohort=="ibd_cohort" & type!="Never_Inflamed")
+
+model_null.ctrl <- lme(fixed = adj_snv ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~ 1)), 
+                      data = ctrl, method="ML")
+
+ibd$predict <- predict(model_null.ctrl,ibd,level=0 )
+ibd$delta <- ibd$adj_snv - ibd$predict
+
+
+## Repeat the above for indels:
+##################################
+
+
+model_null.ctrl_id <- lme(fixed = adj_indel ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~ 1)), 
+                      data = ctrl, method="ML")
+
+ibd$predict_id <- predict(model_null.ctrl_id,ibd,level=0 )
+ibd$delta_id <- ibd$adj_indel - ibd$predict_id
+
+```
+
+
+
+## LMM for signature exposure
+
+I use exactly the same models to test for association between disease duration and exposure to particular mutational signatures, except I use the estimated signature burden as a response variable. 
+
+### Signature 1
+
+Signature 1 is a clock-like signature associated with deamination at CpG sites. It is found ubiquitously in the normal colon. 
+
+```{r}
+
+model_null.sbs1 <- lme(fixed = SBS1 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS1)), method="ML")
+
+
+model_dur.sbs1 <- lme(fixed = SBS1 ~ Age + location  + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur.sbs1, which = "fixed")
+anova(model_null.sbs1,model_dur.sbs1, test=T)$"p-value"[2]
+summary(model_dur.sbs1)
+```
+
+
+### Signature 5
+
+Signature 5 is a clock-like signature and likely is caused by various errors and mistakes that occur during replication. It is found ubiquitously in the normal colon. 
+
+```{r}
+model_null.sbs5 <- lme(fixed = SBS5 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS5)), method="ML")
+
+model_dur.sbs5 <- lme(fixed = SBS5 ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS5)), method="ML")
+
+
+intervals(model_dur.sbs5, which = "fixed")
+anova(model_null.sbs5,model_dur.sbs5, test=T)$"p-value"[2]
+summary(model_dur.sbs5)
+```
+
+### Signature 18
+
+Signature 18 is associated with reactive oxygen species. It is found ubiquitously in the normal colon. 
+
+```{r}
+model_null.sbs18 <- lme(fixed = SBS18 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS18)), method="ML")
+
+model_dur.sbs18 <- lme(fixed = SBS18 ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBS18)), method="ML")
+
+intervals(model_dur.sbs18, which = "fixed")
+anova(model_null.sbs18,model_dur.sbs18, test=T)$"p-value"[2]
+summary(model_dur.sbs18)
+```
+
+## Signature 32
+
+Signature 32 is associated with azathioprine therapy in PCAWG and COSMIC. 
+
+It is associated with disease duration, but this is presumably because only patients undergo purine therapy. We are more interested in finding out if this signature associates with the duration of purine therapy but we see that this is not the case (See Figure S5A and B).
+
+
+```{r}
+model_null.sbs32 <- lme(fixed = SBS32 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur.sbs32 <- lme(fixed = SBS32 ~ Age + location +Coverage+ DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+#summary(model_dur.sbs32)
+intervals(model_dur.sbs32, which = "fixed")
+anova(model_null.sbs32,model_dur.sbs32, test=T)$"p-value"[2]
+```
+
+Test for association between SBS32 burden and duration of purine therapy:
+
+```{r}
+
+purine_users <- subset(test_cohort, cohort=="ibd_cohort" & !is.na(Purine_years))
+
+model_null.sbs32_pur <- lme(fixed = SBS32 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~ 1)), 
+                      weights = varIdent(form= ~ 1),
+                      data = purine_users, method="ML")
+
+model_dur.sbs32_pur <- lme(fixed = SBS32 ~ Age + location + Coverage + Purine_years, 
+                      random = list(patient_ID = pdSymm(form = ~ 1), biopsy_ID = pdSymm(form = ~ 1)), 
+                      weights = varIdent(form= ~ 1),
+                      data = purine_users, method="ML")
+
+#summary(model_dur.sbs32)
+intervals(model_dur.sbs32_pur, which = "fixed")
+anova(model_null.sbs32_pur,model_dur.sbs32_pur, test=T)$"p-value"[2]
+```
+
+## ID1 and ID2
+
+The indel signatures ID1 and ID2 are both thought to be the result of polymerase slippage during DNA replication. 
+
+```{r}
+model_null.id1 <- lme(fixed = ID1 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(ID1)), method="ML")
+
+model_dur.id1<- lme(fixed = ID1 ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur.id1, which = "fixed")
+anova(model_null.id1,model_dur.id1, test=T)$"p-value"[2]
+summary(model_dur.id1)
+
+
+model_null.id2 <- lme(fixed = ID2 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(ID2)), method="ML")
+
+model_dur.id2<- lme(fixed = ID2 ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur.id2, which = "fixed")
+anova(model_null.id2,model_dur.id2, test=T)$"p-value"[2]
+summary(model_dur.id2)
+```
+
+
+### SBSA and IDA
+
+These signatures are highly correlated and result from the same mutational process: Colibactin produced by pks+ intestinal bacteria. The analysis below show that they are associated neither with disease duration nor with disease status. 
+
+```{r}
+model_null.sbsa <- lme(fixed = SBSA ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBSA)), method="ML")
+
+model_dur.sbsa <- lme(fixed = SBSA ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(SBSA)), method="ML")
+
+intervals(model_dur.sbsa, which = "fixed")
+anova(model_null.sbsa,model_dur.sbsa, test=T)$"p-value"[2]
+
+model_null.ida <- lme(fixed = IDA ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur.ida <- lme(fixed = IDA ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur.ida, which = "fixed")
+anova(model_null.ida,model_dur.ida, test=T)$"p-value"[2]
+```
+
+Rather than using disease duration, we may try to simply use disease status to predict SBSA and IDA. Again, find no relationship. 
+
+```{r}
+test_cohort$IBD <- 0
+test_cohort$IBD[test_cohort$cohort=="ibd_cohort"] <- 1
+
+
+model_dis.sbsa <- lme(fixed = SBSA ~ Age + location + Coverage + IBD, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_null.sbsa,model_dis.sbsa, test=T)$"p-value"[2]
+
+
+model_dis.ida <- lme(fixed = IDA ~ Age + location + Coverage + IBD, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+anova(model_null.ida,model_dis.ida, test=T)$"p-value"[2]
+```
+
+### ID14
+
+```{r}
+model_null.id14 <- lme(fixed = ID14 ~ Age + location + Coverage, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(IDA)), method="ML")
+
+model_dur.id14<- lme(fixed = ID14 ~ Age + location + Coverage + DiseaseDuration, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = subset(test_cohort, !is.na(IDA)), method="ML")
+
+intervals(model_dur.id14, which = "fixed")
+anova(model_null.id14,model_dur.id14, test=T)$"p-value"[2]
+summary(model_dur.id14)
+
+```
+
+
+
+
+## Differences between CD and UC
+
+I want to find out if there are differences between CD and UC in terms of the mutation burden or eposure to any particular signatures. I add a fixed effect for IBD subtype and allow the variance to vary between the two diseases. 
+
+I find no significant difference between CD and UC in terms of the total mutation burden. We can test particular signatures in the same way and again, find nothing significant (code not shown).
+
+```{r}
+ibd_data <- subset(test_cohort, cohort=="ibd_cohort")
+ibd_data$Disease <- as.factor(as.character(ibd_data$Disease))
+
+model_null.ibd <- lme(fixed = adj_snv ~ Age + location + Coverage + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = ibd_data, method="ML")
+
+model_dur.ibd <- lme(fixed = adj_snv ~ Age + location + Coverage + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = ibd_data, method="ML")
+
+intervals(model_dur.ibd, which = "fixed")
+anova(model_null.ibd,model_dur.ibd, test=T)$"p-value"[2]
+summary(model_dur.ibd)
+
+
+model_null.ibd.indel <- lme(fixed = adj_indel ~ Age +location+ Coverage + DiseaseDuration,
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$adj_indel)), method="ML")
+
+model_dur.ibd.indel <- lme(fixed = adj_indel ~ Age +location+ Coverage + DiseaseDuration + Disease, 
+                      random = list(patient_ID = pdSymm(form = ~ Disease - 1), biopsy_ID = pdSymm(form = ~ Disease - 1)), 
+                      weights = varIdent(form= ~ 1 | Disease),
+                      data = subset(ibd_data, !is.na(ibd_data$adj_indel)), method="ML")
+
+intervals(model_dur.ibd.indel, which = "fixed")
+anova(model_null.ibd.indel,model_dur.ibd.indel, test=T)$"p-value"[2]
+summary(model_dur.ibd.indel)
+
+```
+
+
+
+## Burden of structural variants
+
+We have called deletions, duplications, somatic retrotranspositions and chromosome-level aneuploidies. Below I test each of those for association with disease. 
+
+
+### CNVs
+
+```{r}
+sv_model.null <- glmer(SV_count ~ Age + location + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+sv_model.dur <- glmer(SV_count ~ Age + location + DiseaseDuration + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+anova(sv_model.null,sv_model.dur, test=T)$"Pr(>Chisq)"[2]
+
+summary(sv_model.dur)$coefficients
+
+## Get the 95% confidence intervals for the effect estimate. 
+summary(sv_model.dur)$coefficients[5,1] - 1.96*summary(sv_model.dur)$coefficients[5,2]
+summary(sv_model.dur)$coefficients[5,1] + 1.96*summary(sv_model.dur)$coefficients[5,2]
+```
+
+
+### Somatic retrotranspositions
+
+I estimate the number of RTs accumulated per year, but actually this doesn't seem to occur at a fixed rate but may rather occur in bursts, since some clones have a large number of RTs while most have none. 
+
+```{r}
+rt_model.null <- glmer(RT_counts ~ Age +location+ Coverage + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+rt_model.dur <- glmer(RT_counts ~ Age + location + Coverage +  DiseaseDuration + (Age - 1|patient_ID/biopsy_ID), data=test_cohort, family="poisson")
+anova(rt_model.null,rt_model.dur, test=T)$"Pr(>Chisq)"[2]
+
+summary(rt_model.dur )$coefficients
+
+## Get the 95% confidence intervals for the effect estimate. 
+summary(rt_model.dur )$coefficients[6,1] - 1.96*summary(rt_model.dur)$coefficients[6,2]
+summary(rt_model.dur )$coefficients[6,1] + 1.96*summary(rt_model.dur )$coefficients[6,2]
+```
+
+
+### Chromosome scale events
+
+I combine aneuploidies, chromosome duplications and loss-of-heterozygosity events into one mutation class. These events are quite rare and there is no point trying to test them individually. I find no differences between cases and controls nor between UC and CD. 
+
+```{r}
+test_cohort$has_chr_event <- NA
+test_cohort$has_chr_event[test_cohort$chr_scale_event=="None"] <- 0
+test_cohort$has_chr_event[test_cohort$chr_scale_event!="None" & !is.na(test_cohort$chr_scale_event)] <- 1
+table(test_cohort$has_chr_event, test_cohort$cohort)
+test_cohort$nr_of_chr_events <- 0
+test_cohort$nr_of_chr_events[test_cohort$has_chr_event==1] <- 1
+test_cohort$nr_of_chr_events[grep(",chr", test_cohort$chr_scale_event)] <- 2
+
+test_cohort$has_IBD <- 0
+test_cohort$has_IBD[test_cohort$cohort=="ibd_cohort"] <- 1
+
+aneuploidies_model <- glmer(has_IBD ~ Age +  has_chr_event + (Age - 1|patient_ID/biopsy_ID), data=subset(test_cohort, !(test_cohort$cohort=="ibd_cohort" & test_cohort$type=="Never_Inflamed")), family="binomial")
+summary(aneuploidies_model)
+
+aneuploidies_model2_null <- glmer(has_chr_event ~ Age + (Age - 1|patient_ID/biopsy_ID), data=subset(test_cohort, !(test_cohort$cohort=="ibd_cohort" & test_cohort$type=="Never_Inflamed")), family="poisson")
+
+aneuploidies_model2_dur <- glmer(has_chr_event ~ Age + DiseaseDuration + (Age - 1|patient_ID/biopsy_ID), data=subset(test_cohort, !(test_cohort$cohort=="ibd_cohort" & test_cohort$type=="Never_Inflamed")), family="poisson")
+summary(aneuploidies_model2_dur)
+
+anova(aneuploidies_model2_null,aneuploidies_model2_dur, test=T)$"Pr(>Chisq)"[2]
+```
+
+### Association analyses of structural variants
+
+One of the reviewers would like to know about differences between CD and UC in terms of chromosomal abnormalities. These are really rare and we almost certainly have no power to ask that question, but hey - since when is that grounds not to do everything the reviewer says? 
+
+I assess this using a mixed effects logistic regression. 
+
+```{r}
+test_cohort$has_DUP <- NA
+test_cohort$has_DUP[!is.na(test_cohort$has_chr_event)] <- 0
+test_cohort$has_DUP[grep("DUP", test_cohort$chr_scale_event)] <- 1
+
+test_cohort$has_DEL <- NA
+test_cohort$has_DEL[!is.na(test_cohort$has_chr_event)] <- 0
+test_cohort$has_DEL[grep("DEL", test_cohort$chr_scale_event)] <- 1
+
+test_cohort$has_LOH <- NA
+test_cohort$has_LOH[!is.na(test_cohort$has_chr_event)] <- 0
+test_cohort$has_LOH[grep("LOH", test_cohort$chr_scale_event)] <- 1
+
+ibd <- subset(test_cohort, cohort=="ibd_cohort")
+
+ibd_DUP_model_null <- glmer(has_DUP ~ Age + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+ibd_DUP_model <- glmer(has_DUP ~ Age + Disease + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+
+
+ibd_DEL_model_null <- glmer(has_DEL ~ Age + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+ibd_DEL_model <- glmer(has_DEL ~ Age + Disease + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+
+
+ibd_LOH_model_null <- glmer(has_LOH ~ Age + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+ibd_LOH_model <- glmer(has_LOH ~ Age + Disease + (Age - 1|patient_ID/biopsy_ID), data=ibd, family="binomial")
+
+anova(ibd_DEL_model_null,ibd_DEL_model, test=T)$"Pr(>Chisq)"[2]
+anova(ibd_DUP_model_null,ibd_DUP_model, test=T)$"Pr(>Chisq)"[2]
+anova(ibd_LOH_model_null,ibd_LOH_model, test=T)$"Pr(>Chisq)"[2]
+
+```
+
+The number of structural variants associates with the mutation burden.
+
+```{r}
+model_dur_RTs.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration + RT_counts, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_RTs.lme)
+intervals(model_dur_RTs.lme, which = "fixed")
+anova(model_dur_RTs.lme,model_dur_cov.lme, test=T)$"p-value"[2]
+
+
+model_dur_cnvs.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration + SV_count, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_cnvs.lme)
+intervals(model_dur_cnvs.lme, which = "fixed")
+anova(model_dur_cnvs.lme,model_dur_cov.lme, test=T)$"p-value"[2]
+
+
+test_cohort$has_chr_event <- NA
+test_cohort$has_chr_event[test_cohort$chr_scale_event=="None"] <- 0
+test_cohort$has_chr_event[test_cohort$chr_scale_event!="None" & !is.na(test_cohort$chr_scale_event)] <- 1
+table(test_cohort$has_chr_event, test_cohort$cohort)
+test_cohort$nr_of_chr_events <- 0
+test_cohort$nr_of_chr_events[test_cohort$has_chr_event==1] <- 1
+test_cohort$nr_of_chr_events[grep(",chr", test_cohort$chr_scale_event)] <- 2
+
+model_dur_aneu.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration + nr_of_chr_events, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_aneu.lme)
+intervals(model_dur_aneu.lme, which = "fixed")
+anova(model_dur_aneu.lme,model_dur_cov.lme, test=T)$"p-value"[2]
+
+
+## Repeat the above for indels
+################################
+
+model_dur_RTs.lme_id <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration + RT_counts, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_RTs.lme_id)
+intervals(model_dur_RTs.lme_id, which = "fixed")
+anova(model_dur_RTs.lme_id,model_dur_cov.indel, test=T)$"p-value"[2]
+
+
+model_dur_cnvs.lme_id <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration + SV_count, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_cnvs.lme_id)
+intervals(model_dur_cnvs.lme_id, which = "fixed")
+anova(model_dur_cnvs.lme_id,model_dur_cov.indel, test=T)$"p-value"[2]
+
+
+model_dur_aneu.lme_id <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration + nr_of_chr_events, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+summary(model_dur_aneu.lme_id)
+intervals(model_dur_aneu.lme_id, which = "fixed")
+anova(model_dur_aneu.lme_id,model_dur_cov.indel, test=T)$"p-value"[2]
+
+```
+
+
+
+## Putative cancer drivers and mutation burden
+
+I want to check if putative cancer drivers are associated with mutation burden and signatures. This will obviously depend on the definition of a driver. Here I have defined a cancer driver as:
+
+1) A non-synonymous mutation in ARID1A or FBXW7
+
+2) A missense mutation occurring in a canonical mutation hotspot from TCGA (see methods)
+
+3) A loss-of-function mutation in a known colorectal tumour repressor. 
+
+```{r}
+
+model_dur_driver.lme <- lme(fixed = adj_snv ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur_driver.lme, which = "fixed")
+anova(model_dur_driver.lme,model_dur_cov.lme, test=T)$"p-value"[2]
+summary(model_dur_driver.lme)
+
+
+model_dur_driver.lme_indel <- lme(fixed = adj_indel ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+intervals(model_dur_driver.lme_indel, which = "fixed")
+anova(model_dur_driver.lme_indel,model_dur_cov.indel, test=T)$"p-value"[2]
+summary(model_dur_driver.lme_indel)
+```
+
+
+
+### See if driver status also influences signature exposure:
+
+Driver status influences the burden of many of the cell proliferation/metabolic stress signatures but interestingly, the strongest association is with the purine-related signature, SBS32. 
+
+These are the results presented in Supplementary Table 4C.
+
+```{r}
+model_dur_driver.sbs1 <- lme(fixed = SBS1 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.sbs5 <- lme(fixed = SBS5 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.sbs18 <- lme(fixed = SBS18 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.sbsa <- lme(fixed = SBSA ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.sbs32 <- lme(fixed = SBS32 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+
+
+model_dur_driver.id1 <- lme(fixed = ID1 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.id2 <- lme(fixed = ID2 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.ida <- lme(fixed = IDA ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+model_dur_driver.id14 <- lme(fixed = ID14 ~ Age + location +Coverage+ DiseaseDuration + cancer_driver, 
+                      random = list(patient_ID = pdSymm(form = ~ cohort - 1), biopsy_ID = pdSymm(form = ~ cohort - 1)), 
+                      weights = varIdent(form= ~ 1 | cohort),
+                      data = test_cohort, method="ML")
+
+
+anova(model_dur.sbs1,model_dur_driver.sbs1, test=T)$"p-value"[2]
+anova(model_dur.sbs5,model_dur_driver.sbs5, test=T)$"p-value"[2]
+anova(model_dur.sbs18,model_dur_driver.sbs18, test=T)$"p-value"[2]
+
+anova(model_dur.sbsa,model_dur_driver.sbsa, test=T)$"p-value"[2]
+anova(model_dur.sbs32,model_dur_driver.sbs32, test=T)$"p-value"[2]
+
+anova(model_dur.id1,model_dur_driver.id1, test=T)$"p-value"[2]
+anova(model_dur.id2,model_dur_driver.id2, test=T)$"p-value"[2]
+anova(model_dur.ida,model_dur_driver.ida, test=T)$"p-value"[2]
+anova(model_dur.id14,model_dur_driver.id14, test=T)$"p-value"[2]
+
+```
+
