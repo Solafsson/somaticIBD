@@ -8,11 +8,11 @@ Scripts required to reproduce the analyses of the manuscript are available at:
 https://github.com/Solafsson/somaticIBD
 See the Key Resources table in the STAR methods for a complete list of all software and from where it can be downloaded.
 
-Raw sequencing data can be accessed from the European Genome-phenome Archive (EGA) with accession codes XXX and XXX [TBC]
+Raw sequencing data can be accessed from the European Genome-phenome Archive (EGA) with the accession code EGAD00001006061
 
 The raw data for the control cohort can be accessed from the European Genome-phenome Archive (EGA) with accession codes EGAD00001004192 and EGAD00001004193.
 
-Mendeley Data repository: http://dx.doi.org/10.17632/x3vsxpspn4.1
+Mendeley Data repository: http://dx.doi.org/10.17632/x3vsxpspn4.2
 
 I have deposited several intermediate files in Mendeley Data. These include:
 * All_IBD_cohort_mutations_mapped_to_branches.txt and the corresponding file for controls contain the full lists of mutations mapped to branches of the phylogenetic trees. The sampleID columns refer to node-numbers of the tree for each particular patient.
